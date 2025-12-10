@@ -42,16 +42,25 @@ function Show-PnPSiteVersionPolicy {
         return
     }
 
-    Write-Host "Current Site Version Policy:" -ForegroundColor Cyan
-    Write-Host ("  EnableAutoExpirationVersionTrim : {0}" -f $policy.EnableAutoExpirationVersionTrim)
-    Write-Host ("  MajorVersions                   : {0}" -f $policy.MajorVersions)
-    Write-Host ("  ExpireVersionsAfterDays         : {0}" -f $policy.ExpireVersionsAfterDays)
+    Write-Host "========== Current Site Version Policy (Raw) ==========" -ForegroundColor Cyan
+    # Show everything the policy object exposes
+    $policy | Format-List * 
+
+    # Derive a status line
+    $autoStatus = if ($policy.EnableAutoExpirationVersionTrim) { "ENABLED" } else { "DISABLED" }
 
     Write-Host ""
-    Write-Host "Review this carefully." -ForegroundColor Yellow
+    Write-Host "----------------- Policy Status Summary -----------------" -ForegroundColor Cyan
+    Write-Host (" Auto-expiration : {0}" -f $autoStatus) -ForegroundColor (if ($policy.EnableAutoExpirationVersionTrim) { "Green" } else { "Yellow" })
+    Write-Host (" Major versions  : {0}" -f $policy.MajorVersions)
+    Write-Host (" Expire after    : {0} days" -f $policy.ExpireVersionsAfterDays)
+    Write-Host "---------------------------------------------------------" -ForegroundColor Cyan
+
+    Write-Host ""
+    Write-Host "Review this carefully before trimming versions." -ForegroundColor Yellow
+
     $answer = Read-Host "Change/update policy now? (y/N)"
     if ($answer -eq 'y') {
-
         $enable = Read-Host "Enable auto expiration version trim? (true/false) [current: $($policy.EnableAutoExpirationVersionTrim)]"
         if ([string]::IsNullOrWhiteSpace($enable)) { $enable = $policy.EnableAutoExpirationVersionTrim }
 
@@ -75,6 +84,7 @@ function Show-PnPSiteVersionPolicy {
         }
     }
 }
+
 
 
 # =====================================================================================
