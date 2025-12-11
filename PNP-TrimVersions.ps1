@@ -1,4 +1,3 @@
-
 <#
 .SYNOPSIS
   Safe SharePoint Online version trim tool using PnP.PowerShell only.
@@ -9,11 +8,10 @@
   - Enumerates document libraries (all, specific, or from CSV).
   - Trims file versions older than N days.
   - ALWAYS runs as DryRun on the first execution (per-user state file).
-  - Uses time-based batching (MaxBatchMinutes) to avoid huge long-running calls.
+  - Processes work in batches (~percentage of total) OR max N minutes per batch.
   - Respects retention, eDiscovery, records (SharePoint blocks invalid deletes).
-  - Logs warnings/errors to CSV if provided.
-  - Optionally logs text events to a rolling text log.
-  - Reports total size before/after, and estimated storage reclaimed.
+  - Logs actions to CSV if provided, and optionally to a text log.
+  - Logs total size before/after and reports estimated storage reclaimed.
 
 .REQUIREMENTS
   - PnP.PowerShell
@@ -24,9 +22,9 @@
   After the first dry run, you can run again with -Delete.
 #>
 
-# -----------------------------------------------------------------------------
-#   Helper: Write-TrimEvent (text log + console levels)
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# Helper: Write-TrimEvent (lightweight text log + console levels)
+# -------------------------------------------------------------------------
 function Write-TrimEvent {
     param(
         [string]$Level,     # Info / Warn / Error
@@ -36,7 +34,6 @@ function Write-TrimEvent {
     $ts   = (Get-Date).ToString("o")
     $line = "[$ts] [$Level] $Message"
 
-    # Text log path is passed into Invoke-PnPVersionTrimTool and stored script-scoped
     if ($script:TextLogPath) {
         $dir = Split-Path $script:TextLogPath -Parent
         if ($dir -and -not (Test-Path $dir)) {
@@ -52,9 +49,9 @@ function Write-TrimEvent {
     }
 }
 
-# -----------------------------------------------------------------------------
-#   Helper: Show-PnPSiteVersionPolicy (+ cooldown marker)
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# Helper: Show-PnPSiteVersionPolicy (+ cooldown marker)
+# -------------------------------------------------------------------------
 function Show-PnPSiteVersionPolicy {
     [CmdletBinding()]
     param()
@@ -74,7 +71,6 @@ function Show-PnPSiteVersionPolicy {
     Write-Host "========== Current Site Version Policy (Raw) ==========" -ForegroundColor Cyan
     $policy | Format-List *
 
-    # Derive a status line
     $autoStatus = if ($policy.EnableAutoExpirationVersionTrim) { "ENABLED" } else { "DISABLED" }
     $color      = if ($policy.EnableAutoExpirationVersionTrim) { 'Green' } else { 'Yellow' }
 
@@ -108,8 +104,6 @@ function Show-PnPSiteVersionPolicy {
                 -ApplyToNewDocumentLibraries
 
             Write-Host "Policy updated." -ForegroundColor Green
-
-            # Record the policy update for cooldown logic
             $global:PnPVersionTrim_LastPolicyUpdateUtc = (Get-Date).ToUniversalTime()
         } catch {
             Write-Warning "Failed to update policy: $($_.Exception.Message)"
@@ -117,9 +111,9 @@ function Show-PnPSiteVersionPolicy {
     }
 }
 
-# -----------------------------------------------------------------------------
-#   Helper: Get-PnPListSizeBytes (fast-ish list size via File_x0020_Size)
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# Helper: Get-PnPListSizeBytes (via File_x0020_Size)
+# -------------------------------------------------------------------------
 function Get-PnPListSizeBytes {
     [CmdletBinding()]
     param(
@@ -140,9 +134,9 @@ function Get-PnPListSizeBytes {
     return $total
 }
 
-# -----------------------------------------------------------------------------
-#   Helper: Write-PnPSizeLog (before/after size snapshots)
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# Helper: Write-PnPSizeLog (before/after size snapshots)
+# -------------------------------------------------------------------------
 function Write-PnPSizeLog {
     [CmdletBinding()]
     param(
@@ -171,9 +165,9 @@ function Write-PnPSizeLog {
     Add-Content -Path $LogPath -Value $line
 }
 
-# -----------------------------------------------------------------------------
-#   Main: Invoke-PnPVersionTrimTool
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# Main: Invoke-PnPVersionTrimTool
+# -------------------------------------------------------------------------
 function Invoke-PnPVersionTrimTool {
     [CmdletBinding()]
     param(
@@ -183,6 +177,7 @@ function Invoke-PnPVersionTrimTool {
         [switch]$Delete,
         [string]$LogPath,
         [string]$TextLogPath,
+        [int]$BatchPercent = 25,
         [int]$MaxBatchMinutes = 5,
         [switch]$AutoContinue,
         [switch]$BypassBatching,
@@ -193,12 +188,9 @@ function Invoke-PnPVersionTrimTool {
         [int]$MaxRetries = 5
     )
 
-    # Make TextLogPath visible to Write-TrimEvent
     $script:TextLogPath = $TextLogPath
 
-    #
-    # --- SAFETY: FIRST RUN MUST ALWAYS BE DRY RUN ---
-    #
+    # ---- SAFETY: First run is ALWAYS dry run ----
     $stateRoot = Join-Path $env:LOCALAPPDATA "PnPVersionTrim"
     if (-not (Test-Path $stateRoot)) {
         New-Item -ItemType Directory -Force -Path $stateRoot | Out-Null
@@ -210,15 +202,13 @@ function Invoke-PnPVersionTrimTool {
 
     if ($firstRun) {
         Write-Host "First run detected. THIS WILL BE A DRY RUN ONLY." -ForegroundColor Yellow
-    }
-    elseif ($Delete) {
+    } elseif ($Delete) {
         $effectiveDryRun = $false
     }
 
     if ($effectiveDryRun) {
         Write-Host "DRY RUN: No versions will be deleted." -ForegroundColor Cyan
-    }
-    else {
+    } else {
         Write-Host "DELETE MODE: Actual deletions will occur." -ForegroundColor Red
         $confirm = Read-Host "Type DELETE to proceed"
         if ($confirm -ne 'DELETE') {
@@ -227,9 +217,7 @@ function Invoke-PnPVersionTrimTool {
         }
     }
 
-    #
-    # --- OPTIONAL CSV LOGGING ---
-    #
+    # ---- Optional CSV logging ----
     if ($LogPath) {
         if (-not (Test-Path (Split-Path $LogPath -Parent))) {
             New-Item -ItemType Directory -Force -Path (Split-Path $LogPath -Parent) | Out-Null
@@ -244,14 +232,11 @@ function Invoke-PnPVersionTrimTool {
                     $Action,$Library,$FileRef,$VersionId,$Label,$Created.ToString("o"),$Result,$Message
             Add-Content -Path $LogPath -Value $line
         }
-    }
-    else {
+    } else {
         function Write-TrimLog { }
     }
 
-    #
-    # --- SHOW POLICY & COOLDOWN ---
-    #
+    # ---- Show policy & enforce cooldown after change ----
     Show-PnPSiteVersionPolicy
 
     if ($global:PnPVersionTrim_LastPolicyUpdateUtc) {
@@ -263,9 +248,7 @@ function Invoke-PnPVersionTrimTool {
         }
     }
 
-    #
-    # --- HELPERS: per-call retry ---
-    #
+    # ---- Helper: ExecuteQuery with exponential backoff ----
     function Invoke-WithRetry([scriptblock]$Action, [int]$Attempts = $MaxRetries) {
         $try = 1
         while ($true) {
@@ -283,13 +266,11 @@ function Invoke-PnPVersionTrimTool {
         }
     }
 
-    #
-    # --- DISCOVER TARGET LIBRARIES ---
-    #
+    # ---- Discover target libraries ----
     $ctx    = Get-PnPContext
     $cutoff = (Get-Date).AddDays(-1 * $OlderThanDays)
 
-    # Increase request timeout to reduce timeouts during large deletes (min 10 minutes)
+    # Request timeout: at least 10 minutes, or based on MaxBatchMinutes
     $ctx.RequestTimeout = [Math]::Max(($MaxBatchMinutes * 60000), 600000)
 
     $libFilter = @()
@@ -308,8 +289,7 @@ function Invoke-PnPVersionTrimTool {
 
     if ($LibraryTitle) {
         $lists = Get-PnPList -Identity $LibraryTitle
-    }
-    else {
+    } else {
         $lists = Get-PnPList | Where-Object { $_.BaseTemplate -eq 101 -and -not $_.Hidden }
         if ($libFilter.Count -gt 0) {
             $lists = $lists | Where-Object { $libFilter -contains $_.Title }
@@ -324,9 +304,7 @@ function Invoke-PnPVersionTrimTool {
     Write-Host ""
     Write-Host ("Target libraries: {0}" -f (($lists | Select-Object -ExpandProperty Title) -join ', ')) -ForegroundColor Green
 
-    #
-    # --- SIZE SNAPSHOT (BEFORE) ---
-    #
+    # ---- Size snapshot (BEFORE) ----
     $runId          = [Guid]::NewGuid().ToString()
     $siteUrl        = (Get-PnPContext).Url
     $startSizeBytes = 0L
@@ -341,155 +319,172 @@ function Invoke-PnPVersionTrimTool {
     }
 
     Write-Host ("Starting total size: {0:N2} MB" -f ($startSizeBytes / 1MB)) -ForegroundColor Cyan
-    Write-TrimEvent -Level 'Info' -Message "Starting trim: OlderThanDays=$OlderThanDays; Cutoff=$cutoff"
+    Write-TrimEvent -Level 'Info' -Message "Starting trim: total libraries = $($lists.Count), cutoff = $cutoff"
 
-    #
-    # --- GLOBAL COUNTERS ---
-    #
-    $script:ProcessedCount       = 0
-    $script:FilesWithOldVersions = 0
-    $script:FailedDeletes        = 0
-    $script:SkippedByError       = 0
-    $script:FilesSeen            = 0
-
-    [int]$MaxFilesPerBatch   = 2000
-    [int]$MaxFilesThreshold  = 200000  # safety cutoff
-
-    #
-    # --- STREAMING ENUMERATION + TRIM ---
-    #
+    # ---- Build work list of files ----
+    $workItems = New-Object System.Collections.Generic.List[object]
     foreach ($list in $lists) {
-        Write-Host "Processing: $($list.Title)" -ForegroundColor Yellow
-        $currentListTitle = $list.Title
+        Write-Host "Discovering files in library: $($list.Title)" -ForegroundColor Yellow
+        $listTitle = $list.Title
 
         Get-PnPListItem -List $list -PageSize 2000 -ScriptBlock {
             param($items)
-
-            if (-not $script:BatchStopwatch) {
-                $script:BatchStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-                $script:FilesInBatch   = 0
-                $script:BatchNumber    = 1
-                Write-Host "===== Batch $($script:BatchNumber) =====" -ForegroundColor Magenta
-            }
-
-            foreach ($i in $items) {
-                if ($i.FileSystemObjectType -ne "File") { continue }
-
-                $script:FilesSeen++
-                $script:FilesInBatch++
-                $script:ProcessedCount++
-
-                # Safety: too many files? bail.
-                if ($script:FilesSeen -gt $MaxFilesThreshold) {
-                    throw "FilesSeen ($($script:FilesSeen)) exceeded MaxFilesThreshold ($MaxFilesThreshold). Aborting for safety."
-                }
-
-                # Progress (unknown total -> 0% but status is still useful)
-                Write-Progress -Activity "Trimming file versions" `
-                               -Status "Processed $($script:ProcessedCount) files; $($script:FilesWithOldVersions) had old versions" `
-                               -PercentComplete 0
-
-                # Load file + versions using existing list item
-                $ctxInner = Get-PnPContext
-                $ctxInner.Load($i.File)
-                $ctxInner.Load($i.File.Versions)
-
-                try {
-                    Invoke-WithRetry { $ctxInner.ExecuteQuery() }
-                }
-                catch {
-                    $msg = $_.Exception.Message
-                    Write-TrimEvent -Level 'Error' -Message ("Failed to load file for item ID {0} in {1}: {2}" -f $i.Id, $currentListTitle, $msg)
-                    $script:SkippedByError++
-                    continue
-                }
-
-                $file     = $i.File
-                $versions = $file.Versions
-
-                # Filter versions older than cutoff (extra safety: not current)
-                $old = @()
-                foreach ($v in $versions) {
-                    if (-not $v.IsCurrentVersion -and $v.Created -lt $cutoff) { $old += $v }
-                }
-                if ($old.Count -eq 0) { continue }
-
-                $script:FilesWithOldVersions++
-
-                # DRY RUN: only log what would be deleted
-                if ($effectiveDryRun) {
-                    foreach ($v in $old) {
-                        Write-TrimLog "DryRun" $currentListTitle $i["FileRef"] $v.ID $v.VersionLabel $v.Created "Planned" "DryRun - would delete"
-                    }
-                    continue
-                }
-
-                # DELETE MODE: delete in chunks to avoid huge CSOM calls
-                $chunkSize = $VersionBatchSize
-                if ($chunkSize -le 0) { $chunkSize = 50 }
-
-                for ($idx = 0; $idx -lt $old.Count; $idx += $chunkSize) {
-                    $chunk = $old[$idx..([math]::Min($idx + $chunkSize - 1, $old.Count - 1))]
-
-                    foreach ($v in $chunk) {
-                        $v.DeleteObject()
-                    }
-
-                    try {
-                        Invoke-WithRetry { $ctxInner.ExecuteQuery() }
-
-                        foreach ($v in $chunk) {
-                            Write-TrimLog "Delete" $currentListTitle $i["FileRef"] $v.ID $v.VersionLabel $v.Created "Deleted" "Deleted"
-                        }
-
-                        if ($VersionBatchPauseMs -gt 0) {
-                            Start-Sleep -Milliseconds $VersionBatchPauseMs
-                        }
-                    }
-                    catch {
-                        $script:FailedDeletes++
-                        $msg = $_.Exception.Message
-
-                        if ($msg -match 'retention|hold|record') {
-                            $script:SkippedByError++
-                            Write-TrimEvent -Level 'Warn' -Message ("Skipped {0} due to retention/hold: {1}" -f $i["FileRef"], $msg)
-                        }
-                        else {
-                            Write-TrimEvent -Level 'Error' -Message ("Failed to delete versions for {0}: {1}" -f $i["FileRef"], $msg)
-                        }
-
-                        foreach ($v in $chunk) {
-                            Write-TrimLog "Delete" $currentListTitle $i["FileRef"] $v.ID $v.VersionLabel $v.Created "Failed" $msg
-                        }
-                    }
-                }
-
-                # Batch timing / user prompt
-                if (-not $BypassBatching -and $script:BatchStopwatch.Elapsed.TotalMinutes -ge $MaxBatchMinutes) {
-                    Write-Host "Batch $($script:BatchNumber) time limit reached." -ForegroundColor Yellow
-
-                    if (-not $AutoContinue) {
-                        $resp = Read-Host "Press Enter to continue, or 'q' to quit"
-                        if ($resp -eq 'q') {
-                            throw "User aborted batches."
-                        }
-                    }
-
-                    $script:BatchStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-                    $script:FilesInBatch   = 0
-                    $script:BatchNumber++
-                    Write-Host "===== Batch $($script:BatchNumber) =====" -ForegroundColor Magenta
-                }
+            foreach ($item in $items) {
+                if ($item.FileSystemObjectType -ne "File") { continue }
+                $workItems.Add([pscustomobject]@{
+                    LibraryTitle = $listTitle
+                    ItemId       = $item.Id
+                    FileLeaf     = $item["FileLeafRef"]
+                    FileRef      = $item["FileRef"]
+                })
             }
         }
     }
 
-    # Finish progress bar
+    $total = $workItems.Count
+    if ($total -eq 0) {
+        Write-Host "No files discovered in target libraries." -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host ""
+    Write-Host "Total files discovered: $total" -ForegroundColor Green
+
+    # ---- Global counters ----
+    $processedCount       = 0
+    $filesWithOldVersions = 0
+    $failedDeletes        = 0
+    $skippedByError       = 0
+
+    Write-TrimEvent -Level 'Info' -Message "Starting file processing: total files = $total, cutoff = $cutoff"
+
+    # ---- Batching (across files) ----
+    if ($BypassBatching) {
+        Write-Host "Batching disabled. Processing all items in one go..." -ForegroundColor Yellow
+        $batchSize       = $total
+        $MaxBatchMinutes = [int]::MaxValue
+    } else {
+        if ($BatchPercent -le 0 -or $BatchPercent -gt 100) { $BatchPercent = 25 }
+        $batchSize = [math]::Ceiling($total * ($BatchPercent / 100))
+        Write-Host "Batch size ~${BatchPercent}% of total or ${MaxBatchMinutes} min, whichever comes first." -ForegroundColor Cyan
+    }
+
+    $index       = 0
+    $batchNumber = 0
+
+    while ($index -lt $total) {
+        $batchNumber++
+        $batchStart = $index
+        $batchEnd   = [math]::Min($batchStart + $batchSize - 1, $total - 1)
+        $timer      = [System.Diagnostics.Stopwatch]::StartNew()
+
+        Write-Host ""
+        Write-Host "===== Batch $batchNumber ($($batchStart+1) to $($batchEnd+1)) =====" -ForegroundColor Magenta
+
+        while ($index -le $batchEnd -and $index -lt $total) {
+
+            if (-not $BypassBatching -and $timer.Elapsed.TotalMinutes -ge $MaxBatchMinutes) {
+                Write-Host "Batch time limit reached; moving to next batch." -ForegroundColor Yellow
+                break
+            }
+
+            $item = $workItems[$index]
+            $index++
+            $processedCount++
+
+            # Progress
+            $percent = [math]::Floor(($processedCount / [double]$total) * 100)
+            Write-Progress -Activity "Trimming file versions" `
+                           -Status "Processed $processedCount of $total files; $filesWithOldVersions had old versions" `
+                           -PercentComplete $percent
+
+            # Load file + versions via List + ItemId
+            $list     = $ctx.Web.Lists.GetByTitle($item.LibraryTitle)
+            $listItem = $list.GetItemById($item.ItemId)
+            $ctx.Load($listItem)
+            $ctx.Load($listItem.File)
+            $ctx.Load($listItem.File.Versions)
+
+            try {
+                Invoke-WithRetry { $ctx.ExecuteQuery() }
+            } catch {
+                $msg = $_.Exception.Message
+                Write-TrimEvent -Level 'Error' -Message ("Failed to load {0}/ID={1}: {2}" -f $item.LibraryTitle, $item.ItemId, $msg)
+                $skippedByError++
+                continue
+            }
+
+            $file     = $listItem.File
+            $versions = $file.Versions
+
+            # Filter versions older than cutoff
+            $old = @()
+            foreach ($v in $versions) {
+                if (-not $v.IsCurrentVersion -and $v.Created -lt $cutoff) { $old += $v }
+            }
+            if ($old.Count -eq 0) { continue }
+
+            $filesWithOldVersions++
+
+            # DRY RUN
+            if ($effectiveDryRun) {
+                foreach ($v in $old) {
+                    Write-TrimLog "DryRun" $item.LibraryTitle $item.FileRef $v.ID $v.VersionLabel $v.Created "Planned" "DryRun - would delete"
+                }
+                continue
+            }
+
+            # DELETE MODE: per-file version batching
+            $chunkSize = $VersionBatchSize
+            if ($chunkSize -le 0) { $chunkSize = 50 }
+
+            for ($i = 0; $i -lt $old.Count; $i += $chunkSize) {
+                $chunk = $old[$i..([math]::Min($i + $chunkSize - 1, $old.Count - 1))]
+
+                foreach ($v in $chunk) {
+                    $v.DeleteObject()
+                }
+
+                try {
+                    Invoke-WithRetry { $ctx.ExecuteQuery() }
+
+                    foreach ($v in $chunk) {
+                        Write-TrimLog "Delete" $item.LibraryTitle $item.FileRef $v.ID $v.VersionLabel $v.Created "Deleted" "Deleted"
+                    }
+
+                    if ($VersionBatchPauseMs -gt 0) {
+                        Start-Sleep -Milliseconds $VersionBatchPauseMs
+                    }
+                } catch {
+                    $failedDeletes++
+                    $msg = $_.Exception.Message
+
+                    if ($msg -match 'retention|hold|record') {
+                        $skippedByError++
+                        Write-TrimEvent -Level 'Warn' -Message ("Skipped {0} due to retention/hold: {1}" -f $item.FileRef, $msg)
+                    } else {
+                        Write-TrimEvent -Level 'Error' -Message ("Failed to delete versions for {0}: {1}" -f $item.FileRef, $msg)
+                    }
+
+                    foreach ($v in $chunk) {
+                        Write-TrimLog "Delete" $item.LibraryTitle $item.FileRef $v.ID $v.VersionLabel $v.Created "Failed" $msg
+                    }
+                }
+            }
+        }
+
+        # Batch pause / prompt
+        if ($index -ge $total) { break }
+
+        if (-not $AutoContinue) {
+            $resp = Read-Host "Batch $batchNumber done. Press Enter to continue, or type 'q' to quit"
+            if ($resp -eq 'q') { break }
+        }
+    }
+
     Write-Progress -Activity "Trimming file versions" -Completed
 
-    #
-    # --- SIZE SNAPSHOT (AFTER) ---
-    #
+    # ---- Size snapshot (AFTER) ----
     $endSizeBytes = 0L
     foreach ($list in $lists) {
         $size = Get-PnPListSizeBytes -ListTitle $list.Title
@@ -502,32 +497,27 @@ function Invoke-PnPVersionTrimTool {
 
     $reclaimed = $startSizeBytes - $endSizeBytes
 
-    #
-    # --- SUMMARY ---
-    #
+    # ---- Summary ----
     Write-Host ""
     Write-Host "===== Version trim summary =====" -ForegroundColor Cyan
-    Write-Host ("  Total files scanned        : {0}" -f $script:ProcessedCount)
-    Write-Host ("  Files with old versions    : {0}" -f $script:FilesWithOldVersions)
-    Write-Host ("  Failed deletions           : {0}" -f $script:FailedDeletes)
-    Write-Host ("  Skipped due to errors/holds: {0}" -f $script:SkippedByError)
+    Write-Host ("  Total files scanned        : {0}" -f $processedCount)
+    Write-Host ("  Files with old versions    : {0}" -f $filesWithOldVersions)
+    Write-Host ("  Failed deletions           : {0}" -f $failedDeletes)
+    Write-Host ("  Skipped due to errors/holds: {0}" -f $skippedByError)
     if ($LogPath)     { Write-Host ("  CSV log                    : {0}" -f $LogPath) }
     if ($TextLogPath) { Write-Host ("  Text log                   : {0}" -f $TextLogPath) }
 
     Write-Host ("Ending total size   : {0:N2} MB" -f ($endSizeBytes / 1MB)) -ForegroundColor Cyan
     Write-Host ("Estimated reclaimed : {0:N2} MB" -f ($reclaimed / 1MB)) -ForegroundColor Green
 
-    #
-    # WRITE STATE FILE (mark that first dry run has occurred)
-    #
+    # ---- Write state file (mark that first run is done) ----
     $stateOut = @{ LastDryRunUtc = (Get-Date).ToUniversalTime().ToString("o") } | ConvertTo-Json
     Set-Content -Path $stateFile -Value $stateOut -Encoding UTF8
 
     Write-Host ""
     if ($effectiveDryRun) {
         Write-Host "DONE (Dry Run). Next run can use -Delete." -ForegroundColor Cyan
-    }
-    else {
+    } else {
         Write-Host "DONE (Deleted permitted versions)." -ForegroundColor Green
     }
 }
